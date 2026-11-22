@@ -1,13 +1,16 @@
 #!/bin/sh
-# Copies MaxMind GeoLite2 databases into an R2 bucket, so managers and developers
-# read them from there instead of from git.
+# Copies the latest MaxMind GeoLite2 databases into an R2 bucket, the place managers and
+# developers are meant to read them from.
 #
 # For each edition, the bucket holds:
 #   <edition>/<edition>.mmdb            the latest database
-#   <edition>/<edition>.tar.gz.sha256   MaxMind's checksum file of the release it came
-#                                       from (the file name in it carries the build date)
-# A pass downloads an edition only when MaxMind's checksum differs from the stored one.
-# The .mmdb is overwritten, so the bucket keeps no old versions (GeoLite EULA §6.3).
+#   <edition>/<edition>.tar.gz.sha256   "<sha256>  <edition>_<YYYYMMDD>.tar.gz": the release
+#                                       the database came from, and its checksum
+# A pass asks MaxMind for the current release name with a HEAD request, which does not
+# count against GeoLite's 30 downloads a day, and downloads only a release the bucket
+# lacks. A downloaded release stays in $CACHE until it is stored, so a failed upload is
+# retried without downloading it again. Each upload overwrites the previous database, so
+# no old versions are kept (GeoLite EULA §6.3).
 #
 # Usage: geoip-sync           sync now, then every 12 hours
 #                             (1 hour after a pass in which an edition failed)
@@ -18,6 +21,7 @@ EDITIONS="GeoLite2-City GeoLite2-ASN"
 INTERVAL_SECONDS=$((12 * 3600))
 RETRY_SECONDS=3600
 DOWNLOAD_URL="https://download.maxmind.com/geoip/databases"
+CACHE="${TMPDIR:-/tmp}/geoip-sync"
 
 : "${MAXMIND_ACCOUNT_ID:?MAXMIND_ACCOUNT_ID is required}"
 : "${MAXMIND_LICENSE_KEY:?MAXMIND_LICENSE_KEY is required}"
@@ -40,60 +44,88 @@ log() {
 	echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') $*"
 }
 
-# Downloads "$DOWNLOAD_URL/<edition>/download?suffix=<suffix>" to a file. The
-# credentials go to curl through stdin, so they never show on a command line. curl
-# does not send them on to the presigned URL MaxMind redirects to.
-download() {
+# curl against MaxMind's download URLs, HTTPS only, following the redirect to a presigned
+# URL. The credentials go to curl through stdin, so they never show on a command line;
+# curl does not send them on to the redirect's host.
+maxmind() {
 	printf 'user = "%s:%s"\n' "$MAXMIND_ACCOUNT_ID" "$MAXMIND_LICENSE_KEY" |
 		curl --config - --fail --silent --show-error --location \
-			--retry 3 --max-time 600 \
-			--output "$3" "$DOWNLOAD_URL/$1/download?suffix=$2"
+			--proto =https --proto-redir =https --max-time 600 "$@"
 }
 
-# Syncs one edition. Returns non-zero on any failure; the bucket then keeps what it had.
+# Syncs one edition. Returns non-zero on any failure. The bucket then holds the previous
+# release, or the new database without a checksum file, which the next pass completes.
 sync_edition() {
 	edition=$1
-	dir="$work/$edition"
-	mkdir -p "$dir/x" || return 1
+	url="$DOWNLOAD_URL/$edition/download?suffix"
 
-	download "$edition" tar.gz.sha256 "$dir/release.sha256" || return 1
-	# The checksum file reads "<sha256>  <edition>_<YYYYMMDD>.tar.gz".
-	read -r want release <"$dir/release.sha256" || true
-	if [ -z "${want:-}" ] || [ -z "${release:-}" ]; then
-		log "$edition: unexpected checksum file from MaxMind"
+	# The file name in Content-Disposition carries the build date.
+	release=$(maxmind --head "$url=tar.gz" | tr -d '\r' |
+		grep -i '^content-disposition:' | tail -n 1 | sed 's/.*filename=//; s/[";]//g')
+	case $release in
+	"${edition}"_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].tar.gz) ;;
+	*)
+		log "$edition: no release name from MaxMind"
+		return 1
+		;;
+	esac
+
+	# Exit status 3 is rclone's "directory not found": nothing stored yet.
+	stored=$(rclone lsf "r2:$R2_BUCKET/$edition/")
+	status=$?
+	if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then
+		log "$edition: cannot list the bucket"
 		return 1
 	fi
-
-	# A failed read (no object yet, or R2 trouble) counts as "not stored": the upload
-	# below then fails loudly if R2 is the problem.
-	have=$(rclone cat "r2:$R2_BUCKET/$edition/$edition.tar.gz.sha256" 2>/dev/null | cut -d ' ' -f 1)
-	if [ "$want" = "$have" ]; then
-		log "$edition: up to date ($release)"
-		return 0
+	if printf '%s\n' "$stored" | grep -qx "$edition.mmdb" &&
+		printf '%s\n' "$stored" | grep -qx "$edition.tar.gz.sha256"; then
+		have=$(rclone cat "r2:$R2_BUCKET/$edition/$edition.tar.gz.sha256") || return 1
+		if [ "${have#*  }" = "$release" ]; then
+			log "$edition: up to date ($release)"
+			return 0
+		fi
 	fi
 
-	download "$edition" tar.gz "$dir/$release" || return 1
-	if ! (cd "$dir" && echo "$want  $release" | sha256sum -c - >/dev/null); then
-		log "$edition: checksum mismatch for $release"
+	dir="$CACHE/$edition"
+	if [ ! -f "$dir/$release" ]; then
+		# Drops an older release left from a pass that failed.
+		rm -rf "$dir"
+		mkdir -p "$dir" || return 1
+		maxmind --output "$dir/release.sha256" "$url=tar.gz.sha256" || return 1
+		maxmind --output "$dir/$release.part" "$url=tar.gz" || return 1
+		mv "$dir/$release.part" "$dir/$release" || return 1
+	fi
+
+	# The checksum file reads "<sha256>  <release>".
+	read -r want _ <"$dir/release.sha256" || true
+	case ${want:-} in
+	*[!0-9a-f]*) want="" ;;
+	esac
+	if [ "${#want}" -ne 64 ] || ! (cd "$dir" && echo "$want  $release" | sha256sum -c - >/dev/null); then
+		log "$edition: $release does not match MaxMind's checksum"
+		rm -rf "$dir"
 		return 1
 	fi
-	tar -xzf "$dir/$release" -C "$dir/x" || return 1
-	mmdb=$(find "$dir/x" -type f -name "$edition.mmdb" | head -n 1)
-	if [ -z "$mmdb" ]; then
+	if ! tar -xzOf "$dir/$release" "${release%.tar.gz}/$edition.mmdb" >"$dir/$edition.mmdb"; then
 		log "$edition: no $edition.mmdb in $release"
+		rm -rf "$dir"
 		return 1
 	fi
+	printf '%s  %s\n' "$want" "$release" >"$dir/stored.sha256" || return 1
 
-	# Database first, checksum file last: a stored checksum always matches the stored
-	# database, and an interrupted pass is retried on the next one.
-	rclone copyto "$mmdb" "r2:$R2_BUCKET/$edition/$edition.mmdb" || return 1
-	rclone copyto "$dir/release.sha256" "r2:$R2_BUCKET/$edition/$edition.tar.gz.sha256" || return 1
-	log "$edition: stored $release ($(wc -c <"$mmdb") bytes)"
+	# Old checksum file first, new one last: a checksum file in the bucket always names the
+	# database next to it.
+	if printf '%s\n' "$stored" | grep -qx "$edition.tar.gz.sha256"; then
+		rclone deletefile "r2:$R2_BUCKET/$edition/$edition.tar.gz.sha256" || return 1
+	fi
+	rclone copyto "$dir/$edition.mmdb" "r2:$R2_BUCKET/$edition/$edition.mmdb" || return 1
+	rclone copyto "$dir/stored.sha256" "r2:$R2_BUCKET/$edition/$edition.tar.gz.sha256" || return 1
+	log "$edition: stored $release ($(wc -c <"$dir/$edition.mmdb") bytes)"
+	rm -rf "$dir"
 }
 
 # One pass over every edition. Returns non-zero if any edition failed.
 sync_all() {
-	work=$(mktemp -d) || return 1
 	failed=0
 	for edition in $EDITIONS; do
 		if ! sync_edition "$edition"; then
@@ -101,16 +133,8 @@ sync_all() {
 			failed=1
 		fi
 	done
-	rm -rf "$work"
-	work=""
 	return "$failed"
 }
-
-# As PID 1 in a container, sh ignores SIGTERM unless it is trapped. sleep runs in the
-# background so the trap fires at once instead of after the sleep.
-work=""
-sleeper=""
-trap '[ -n "$sleeper" ] && kill "$sleeper" 2>/dev/null; rm -rf "$work"; exit 143' TERM INT
 
 case "${1:-}" in
 --once)
@@ -119,13 +143,10 @@ case "${1:-}" in
 "")
 	while :; do
 		if sync_all; then
-			sleep "$INTERVAL_SECONDS" &
+			sleep "$INTERVAL_SECONDS"
 		else
-			sleep "$RETRY_SECONDS" &
+			sleep "$RETRY_SECONDS"
 		fi
-		sleeper=$!
-		wait "$sleeper"
-		sleeper=""
 	done
 	;;
 *)

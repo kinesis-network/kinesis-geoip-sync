@@ -1,12 +1,14 @@
 # kinesis-geoip-sync
 
-Keeps the latest MaxMind GeoLite2 databases in a private R2 bucket. Managers and developers read the `.mmdb` files
-from there, so the files stay out of git and stay current.
+Keeps the latest MaxMind GeoLite2 databases in a private R2 bucket, the place managers and developers are meant to
+read the `.mmdb` files from, so they can stay out of git and stay current.
 
 Every 12 hours (1 hour after a pass that failed), for `GeoLite2-City` and `GeoLite2-ASN`:
 
-1. Download MaxMind's `.sha256` for the latest release and compare it with the one in the bucket.
-2. If it differs, download the release, check it against that checksum, and upload the `.mmdb`, then the checksum file.
+1. Ask MaxMind for the current release name (a HEAD request, which doesn't count as a download) and compare it with
+   the one in the bucket.
+2. If the bucket lacks it, download the release and its `.sha256`, check them, and upload the `.mmdb`, then the
+   checksum file. A downloaded release is kept until it is stored, so a failed upload doesn't download it again.
 
 ## Bucket layout
 
@@ -29,7 +31,9 @@ docker run -d --name geoip-sync \
   kinesisorg/kinesis-geoip-sync:latest
 ```
 
-| Variable | |
+All are required.
+
+| Variable | Meaning |
 |---|---|
 | `MAXMIND_ACCOUNT_ID`, `MAXMIND_LICENSE_KEY` | MaxMind account and a license key for this job |
 | `R2_ACCOUNT_ID` | Cloudflare account id (the endpoint is `https://<id>.r2.cloudflarestorage.com`) |
@@ -37,7 +41,8 @@ docker run -d --name geoip-sync \
 | `R2_BUCKET` | bucket name |
 
 `geoip-sync --once` (e.g. `docker run --rm ... kinesisorg/kinesis-geoip-sync:latest --once`) runs one pass and exits
-non-zero if an edition failed. GeoLite allows 30 downloads a day; a pass downloads a release only when it changed.
+non-zero if an edition failed. GeoLite allows 30 downloads a day per account; a new release costs two (the
+`.tar.gz` and its `.sha256`).
 
 ## Get the files for local debugging
 
